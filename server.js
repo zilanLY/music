@@ -2,6 +2,10 @@
  * Leapcell Server — Combines Express API + Static Files in one process
  * - /* (all paths)           → netease-cloud-music-api-alger (music API)
  * - /* (fallback)            → dist/ (Vite build output, SPA)
+ *
+ * ⚡ VIP 歌曲多源解析修复:
+ * 当 /song/enhance/player/url 返回 url=null 时，
+ * 自动尝试 /api/song/enhance/download/url 兜底获取有效链接。
  */
 const path = require('path');
 const fs = require('fs');
@@ -100,6 +104,86 @@ async function buildApp() {
       }
     });
   }
+
+  // ── ⚡ VIP 歌曲多源解析路由 ──────────────────────────────────────────
+  // 拦截 /song/enhance/player/url，当 url=null 时自动 fallback 到 download/url
+  const vipUrlPattern = /^\/(api\/)?song\/enhance\/player\/url$/i;
+  app.all(vipUrlPattern, async (req, res) => {
+    [req.query, req.body].forEach((item) => {
+      if (item && typeof item.cookie === 'string') {
+        item.cookie = cookieToJson(decode(item.cookie));
+      }
+    });
+
+    const query = Object.assign({}, { cookie: req.cookies }, req.query, req.body);
+    const ids = String(query.id || query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+    const br = parseInt(query.br || 999000);
+
+    if (!ids.length) { res.status(400).send({ code: 400, msg: '缺少 id 参数' }); return; }
+
+    const makeRequest = (...args) => {
+      const params = [...args];
+      let ip = req.ip;
+      if (ip && ip.substring(0, 7) === '::ffff:') ip = ip.substring(7);
+      if (ip === '::1') ip = global.cnIp || '127.0.0.1';
+      params[3] = { ...params[3], ip };
+      return request(...params);
+    };
+
+    try {
+      // 主接口
+      const mainRes = await makeRequest('/api/song/enhance/player/url',
+        { ids: JSON.stringify(ids), br },
+        { crypto: 'eapi', cookie: query.cookie, ua: query.ua || '', realIP: query.realIP, e_r: query.e_r, domain: '', checkToken: false }
+      );
+      const mainData = mainRes.body?.data || [];
+
+      if (!mainData.length) throw new Error('empty response');
+
+      const nullUrls = mainData.filter(item => !item.url || item.url === '');
+      const validUrls = mainData.filter(item => item.url && item.url !== '');
+
+      if (!nullUrls.length) {
+        mainData.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
+        res.status(200).send({ code: 200, data: mainData });
+        return;
+      }
+
+      // 有 url=null 的歌曲，尝试 download/url 兜底
+      console.log(`[VIP-Fix] ${nullUrls.length}/${ids.length} songs need fallback`);
+
+      const bitrates = [999000, 320000, 192000, 128000, 96000, 64000];
+      const fallbackResults = await Promise.all(nullUrls.map(async (item) => {
+        for (const b of bitrates) {
+          try {
+            const r = await makeRequest('/api/song/enhance/download/url',
+              { id: item.id, br: b },
+              { crypto: 'eapi', cookie: query.cookie, ua: query.ua || '', realIP: query.realIP, e_r: query.e_r, domain: '', checkToken: false }
+            );
+            if (r.body?.url) {
+              return { id: item.id, url: r.body.url, br: r.body.br || b, size: r.body.size || 0,
+                type: r.body.type || 'mp3', md5: r.body.md5 || '', code: 200, level: r.body.level || 'standard',
+                gain: r.body.gain || 0, peak: r.body.peak || 0, mvUrl: item.mvUrl || null };
+            }
+          } catch (_) { /* continue */ }
+        }
+        return { id: item.id, url: null, br: 999000, size: 0, type: 'mp3', md5: '',
+          code: 200, level: 'standard', gain: 0, peak: 0, mvUrl: item.mvUrl || null };
+      }));
+
+      const fallbackMap = new Map(fallbackResults.map(r => [String(r.id), r]));
+      const merged = mainData.map(item => (!item.url && fallbackMap.has(String(item.id))) ? fallbackMap.get(String(item.id)) : item);
+      merged.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
+
+      const successCount = merged.filter(i => i.url).length;
+      console.log(`[VIP-Fix] Result: ${successCount}/${ids.length} songs got URL`);
+
+      res.status(200).send({ code: 200, data: merged });
+    } catch (err) {
+      console.error('[VIP-Fix] Error:', err.message);
+      res.status(502).send({ code: 502, msg: 'VIP fallback failed', detail: err.message });
+    }
+  });
 
   // 确保 B站缓存目录存在（Leapcell 容器中 node_modules 可能是只读的，
   // biliApiHandler.js 的 saveCookies 会尝试 mkdir，提前创建避免 ENOENT）
