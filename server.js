@@ -6,6 +6,30 @@
  * ⚡ VIP 歌曲解灰修复:
  * 官方 API 返回 url=null 时，通过 @unblockneteasemusic/server 从第三方平台解灰。
  */
+
+// ── Patch @unblockneteasemusic/server find.js ──────────────────────────────
+// 修复: NCM API 返回 ar/al 字段，UNM find.js 只认 artists/album
+// 在加载 UNM 之前 patch，避免 getFormatData 崩溃
+{
+  const findJsPath = path.join(__dirname, 'node_modules', '@unblockneteasemusic', 'server', 'src', 'provider', 'find.js');
+  const content = fs.readFileSync(findJsPath, 'utf-8');
+  const alreadyPatched = content.includes('rawArtists');
+  if (!alreadyPatched) {
+    const patched = content
+      .replace(
+        `info.artists = data.artists.map((artist) =>`,
+        `const rawArtists = data.artists || (data.ar || []);\n      info.artists = (Array.isArray(rawArtists) ? rawArtists : []).map((artist) =>`
+      )
+      .replace(
+        `info.album = filter(data.album, ['id', 'name']);`,
+        `const rawAlbum = data.album || data.al || {};\n      info.album = filter(rawAlbum, ['id', 'name']);`
+      );
+    fs.writeFileSync(findJsPath, patched, 'utf-8');
+    console.log('[UNM-Patch] find.js patched: ar/al -> artists/album');
+  } else {
+    console.log('[UNM-Patch] find.js already patched, skipping');
+  }
+}
 const path = require('path');
 const fs = require('fs');
 
