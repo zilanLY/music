@@ -180,50 +180,17 @@ async function buildApp() {
 
         console.log(`[UNM] ${nullSongs.length}/${ids.length} songs need ungray: ${nullSongs.map(s => s.id).join(',')}`);
 
-        // 2) 获取这些歌曲的元数据（用于在第三方平台搜索）
-        const nullIds = nullSongs.map(s => s.id);
-        let songMetaMap = new Map();
-
-        try {
-          const detailRes = await req_(
-            '/api/v3/song/detail',
-            { ids: JSON.stringify(nullIds.map(id => ({ id: String(id) }))) },
-            { crypto: 'weapi', cookie: query.cookie, ua: query.ua || '', realIP: getRealIp(req), e_r: query.e_r, domain: '', checkToken: false }
-          );
-          const songs = detailRes.body?.songs || [];
-          for (const song of songs) {
-            songMetaMap.set(String(song.id), {
-              name: song.name,
-              artist: (song.ar || []).map(a => a.name).join(','),
-              album: song.al?.name || '',
-              albumId: song.al?.id,
-              duration: song.dt,
-            });
-          }
-        } catch (e) {
-          console.warn('[UNM] song_detail failed, using minimal metadata:', e.message);
-          for (const id of nullIds) {
-            songMetaMap.set(String(id), { name: '', artist: '', album: '', albumId: null, duration: 0 });
-          }
-        }
-
-        // 3) 用 UNM 解灰
+        // 3) 用 UNM 解灰（不传 metadata，让 UNM 自己调 /api/song/detail 获取）
         const fallbackMap = new Map();
 
         if (unmMatch) {
-          // 串行解灰，避免并发过高被限流
           for (const id of nullIds) {
-            const meta = songMetaMap.get(String(id)) || {};
-            console.log(`[UNM] Searching for: ${meta.name || id} - ${meta.artist || 'unknown'}`);
+            console.log(`[UNM] Searching id: ${id}`);
 
             try {
-              const result = await unmMatch(String(id), UNM_SERVERS, {
-                name: meta.name || '',
-                artist: meta.artist || '',
-                album: meta.album || '',
-                albumId: meta.albumId,
-                duration: meta.duration,
-              });
+              // match(id, servers) — 不传第三个参数
+              // UNM 会自动调用 /api/song/detail?ids=[id] 获取元数据
+              const result = await unmMatch(String(id), UNM_SERVERS);
 
               if (result?.url) {
                 fallbackMap.set(String(id), {
@@ -239,12 +206,12 @@ async function buildApp() {
                   peak: 0,
                   mvUrl: nullSongs.find(s => String(s.id) === String(id))?.mvUrl || null,
                 });
-                console.log(`[UNM] ✓ id=${id} got URL from ${result.source}: ${result.url.substring(0, 80)}`);
+                console.log(`[UNM] ✓ id=${id} got URL from ${result.source}: ${String(result.url).substring(0, 80)}`);
               } else {
                 console.log(`[UNM] ✗ id=${id} no URL returned`);
               }
             } catch (e) {
-              console.log(`[UNM] ✗ id=${id} error: ${e.message}`);
+              console.log(`[UNM] ✗ id=${id} error: ${e?.message || String(e)}`);
             }
           }
         } else {
@@ -263,7 +230,7 @@ async function buildApp() {
 
         res.status(200).send({ code: 200, data: merged });
       } catch (err) {
-        console.error('[UNM] Fatal error:', err.message);
+        console.error('[UNM] Fatal error:', err?.message || String(err));
         res.status(502).send({ code: 502, msg: 'Song URL failed', detail: err.message });
       }
     });
