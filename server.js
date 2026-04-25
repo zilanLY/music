@@ -4,12 +4,10 @@
  * - /* (fallback)            → dist/ (Vite build output, SPA)
  *
  * ⚡ VIP 歌曲解灰修复:
- * 当 /song/enhance/player/url 返回 url=null 时，
- * 使用 @unblockneteasemusic/server 从酷我/酷狗/咪咕/哔哩哔哩获取替代链接。
+ * 官方 API 返回 url=null 时，通过 @unblockneteasemusic/server 从第三方平台解灰。
  */
 const path = require('path');
 const fs = require('fs');
-const zlib = require('zlib');
 
 const PORT = process.env.PORT || 8080;
 
@@ -23,13 +21,12 @@ async function buildApp() {
   app.use(express.urlencoded({ extended: false, limit: '50mb' }));
   app.use(require('express-fileupload')());
 
-  // ── 动态加载 netease-cloud-music-api-alger 路由 ───────────────────────
+  // ── 加载 netease-cloud-music-api-alger ──────────────────────────────
   const moduleBase = path.join(__dirname, 'node_modules', 'netease-cloud-music-api-alger', 'module');
 
   const { middleware: cacheMiddleware } = require('netease-cloud-music-api-alger/util/apicache');
   const { cookieToJson } = require('netease-cloud-music-api-alger/util/index');
   const request = require('netease-cloud-music-api-alger/util/request');
-  const { biliRequest } = require('netease-cloud-music-api-alger/util/biliRequest');
   const { registerBiliApis } = require('netease-cloud-music-api-alger/util/biliApiHandler');
   const biliApiConfigs = require('netease-cloud-music-api-alger/bili/biliApiConfigs');
   const decode = require('safe-decode-uri-component');
@@ -59,7 +56,42 @@ async function buildApp() {
     next();
   });
 
-  // 加载所有 API 模块
+  // ── 加载 UNM ─────────────────────────────────────────────────────────
+  let unmMatch = null;
+  try {
+    unmMatch = require('@unblockneteasemusic/server');
+    console.log('[UNM] @unblockneteasemusic/server loaded, version:', require('@unblockneteasemusic/server/package.json').version);
+  } catch (e) {
+    console.warn('[UNM] Failed to load @unblockneteasemusic/server:', e.message);
+  }
+
+  // 第三方音源优先级
+  const UNM_SERVERS = ['kuwo', 'kugou', 'migu', 'bilibili'];
+
+  // ── 辅助函数 ─────────────────────────────────────────────────────────
+  function getRealIp(req) {
+    let ip = req.ip || '';
+    if (ip.substring(0, 7) === '::ffff:') ip = ip.substring(7);
+    if (ip === '::1') ip = global.cnIp || '127.0.0.1';
+    return ip;
+  }
+
+  function makeRequest(req, cookieObj, extraOptions = {}) {
+    return (...args) => {
+      const params = [...args];
+      params[3] = { ...params[3], ip: getRealIp(req), ...extraOptions };
+      return request(...params);
+    };
+  }
+
+  // 解析 cookie 字符串
+  function parseCookie(raw) {
+    if (typeof raw === 'object') return raw;
+    if (typeof raw === 'string') return cookieToJson(decode(raw));
+    return {};
+  }
+
+  // 加载所有 netease API 模块
   const files = (await fs.promises.readdir(moduleBase)).reverse().filter((f) => f.endsWith('.js'));
 
   const specialRoutes = {
@@ -72,25 +104,20 @@ async function buildApp() {
     const route = specialRoutes[file] || `/${file.replace(/\.js$/i, '').replace(/_/g, '/')}`;
     const mod = require(path.join(moduleBase, file));
 
+    // 跳过 song_url 路由（我们自己处理）
+    if (/^\/(api\/)?song[\/_]url/i.test(route)) continue;
+
     app.use(route, async (req, res) => {
       [req.query, req.body].forEach((item) => {
         if (item && typeof item.cookie === 'string') {
-          item.cookie = cookieToJson(decode(item.cookie));
+          item.cookie = parseCookie(item.cookie);
         }
       });
 
       const query = Object.assign({}, { cookie: req.cookies }, req.query, req.body, req.files || {});
 
       try {
-        const resp = await mod(query, (...args) => {
-          const params = [...args];
-          let ip = req.ip;
-          if (ip && ip.substring(0, 7) === '::ffff:') ip = ip.substring(7);
-          if (ip === '::1') ip = global.cnIp || '127.0.0.1';
-          params[3] = { ...params[3], ip };
-          return request(...params);
-        });
-
+        const resp = await mod(query, makeRequest(req, query.cookie));
         if (!query.noCookie && Array.isArray(resp.cookie) && resp.cookie.length > 0) {
           res.append('Set-Cookie', resp.cookie.map((c) =>
             req.protocol === 'https' ? `${c}; SameSite=None; Secure` : c
@@ -105,120 +132,144 @@ async function buildApp() {
     });
   }
 
-  // ── ⚡ VIP 歌曲解灰路由 ──────────────────────────────────────────────
-  // 拦截 /song/enhance/player/url，url=null 时用 @unblockneteasemusic/server 解灰
-  // 从酷我/酷狗/咪咕/哔哩哔哩等第三方平台获取替代播放链接
-  let unmMatch = null;
-  try {
-    unmMatch = require('@unblockneteasemusic/server').match;
-    console.log('[UNM] @unblockneteasemusic/server loaded successfully');
-  } catch (e) {
-    console.warn('[UNM] Failed to load @unblockneteasemusic/server:', e.message);
-    console.warn('[UNM] VIP song fallback will be disabled');
-  }
+  // ── ⚡ VIP 解灰路由 ─────────────────────────────────────────────────
+  // 拦截所有 /song/url 和 /song/enhance/player/url 请求
+  const vipPatterns = [
+    /^\/(api\/)?song[\/_]url(\/v1)?$/i,
+    /^\/(api\/)?song\/enhance\/player\/url$/i,
+  ];
 
-  // 第三方音源优先级（去掉 pyncmd，需要 ffmpeg 转码太重）
-  const UNM_SERVERS = ['kuwo', 'kugou', 'migu', 'bilibili'];
-
-  const vipUrlPattern = /^\/(api\/)?song\/enhance\/player\/url$/i;
-  app.all(vipUrlPattern, async (req, res) => {
-    [req.query, req.body].forEach((item) => {
-      if (item && typeof item.cookie === 'string') {
-        item.cookie = cookieToJson(decode(item.cookie));
-      }
-    });
-
-    const query = Object.assign({}, { cookie: req.cookies }, req.query, req.body);
-    const ids = String(query.id || query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
-    const br = parseInt(query.br || 999000);
-
-    if (!ids.length) { res.status(400).send({ code: 400, msg: '缺少 id 参数' }); return; }
-
-    const makeRequest = (...args) => {
-      const params = [...args];
-      let ip = req.ip;
-      if (ip && ip.substring(0, 7) === '::ffff:') ip = ip.substring(7);
-      if (ip === '::1') ip = global.cnIp || '127.0.0.1';
-      params[3] = { ...params[3], ip };
-      return request(...params);
-    };
-
-    try {
-      // 1) 主接口 — 网易云官方 API
-      const mainRes = await makeRequest('/api/song/enhance/player/url',
-        { ids: JSON.stringify(ids), br },
-        { crypto: 'eapi', cookie: query.cookie, ua: query.ua || '', realIP: query.realIP, e_r: query.e_r, domain: '', checkToken: false }
-      );
-      const mainData = mainRes.body?.data || [];
-      if (!mainData.length) throw new Error('empty response');
-
-      // 2) 检查哪些歌曲没有有效 URL
-      const nullIds = mainData.filter(item => !item.url || item.url === '').map(item => String(item.id));
-      if (!nullIds.length) {
-        mainData.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
-        res.status(200).send({ code: 200, data: mainData });
-        return;
-      }
-
-      // 3) 用 UNM 从第三方平台获取替代链接
-      console.log(`[UNM] ${nullIds.length}/${ids.length} songs need ungray: ${nullIds.join(',')}`);
-
-      const fallbackMap = new Map();
-      if (unmMatch) {
-        const unmResults = await Promise.allSettled(
-          nullIds.map(id => unmMatch(id, UNM_SERVERS))
-        );
-        for (let i = 0; i < unmResults.length; i++) {
-          const result = unmResults[i];
-          const id = nullIds[i];
-          if (result.status === 'fulfilled' && result.value?.url) {
-            fallbackMap.set(id, {
-              id: Number(id),
-              url: result.value.url,
-              source: result.value.source,
-              br: result.value.br || br,
-              size: 0,
-              type: 'mp3',
-              md5: '',
-              code: 200,
-              level: 'standard',
-              gain: 0,
-              peak: 0,
-              mvUrl: null,
-            });
-            console.log(`[UNM] ✓ id=${id} from ${result.value.source}`);
-          } else {
-            const reason = result.status === 'fulfilled'
-              ? 'no url returned'
-              : result.reason.message;
-            console.log(`[UNM] ✗ id=${id} failed: ${reason}`);
-          }
+  for (const pattern of vipPatterns) {
+    app.all(pattern, async (req, res) => {
+      [req.query, req.body].forEach((item) => {
+        if (item && typeof item.cookie === 'string') {
+          item.cookie = parseCookie(item.cookie);
         }
-      } else {
-        console.log('[UNM] Skipping fallback (UNM not available)');
-      }
-
-      // 4) 合并结果
-      const merged = mainData.map(item => {
-        if (item.url && item.url !== '') return item; // 官方有链接，保持不变
-        const fallback = fallbackMap.get(String(item.id));
-        if (fallback) return fallback;
-        return item; // 都没拿到，保持原样
       });
 
-      merged.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
-      const successCount = merged.filter(i => i.url).length;
-      console.log(`[UNM] Final: ${successCount}/${ids.length} songs got URL`);
+      const query = Object.assign({}, { cookie: req.cookies }, req.query, req.body);
+      const ids = String(query.id || query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+      const br = parseInt(query.br || 999000);
+      const level = query.level || 'exhigh';
 
-      res.status(200).send({ code: 200, data: merged });
-    } catch (err) {
-      console.error('[UNM] Error:', err.message);
-      res.status(502).send({ code: 502, msg: 'Song URL failed', detail: err.message });
-    }
-  });
+      if (!ids.length) { res.status(400).send({ code: 400, msg: '缺少 id 参数' }); return; }
 
-  // 确保 B站缓存目录存在（Leapcell 容器中 node_modules 可能是只读的，
-  // biliApiHandler.js 的 saveCookies 会尝试 mkdir，提前创建避免 ENOENT）
+      const req_ = makeRequest(req, query.cookie);
+
+      try {
+        // 1) 先调官方 API 拿 URL 和歌曲元数据
+        let mainData = [];
+        try {
+          const mainRes = await req_(
+            '/api/song/enhance/player/url',
+            { ids: JSON.stringify(ids), br },
+            { crypto: 'eapi', cookie: query.cookie, ua: query.ua || '', realIP: getRealIp(req), e_r: query.e_r, domain: '', checkToken: false }
+          );
+          mainData = mainRes.body?.data || [];
+        } catch (e) {
+          console.warn('[UNM] Official API failed:', e.message);
+        }
+
+        // 找出 url=null 的歌曲
+        const nullSongs = mainData.filter(item => !item.url || item.url === '');
+        if (nullSongs.length === 0) {
+          mainData.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
+          res.status(200).send({ code: 200, data: mainData });
+          return;
+        }
+
+        console.log(`[UNM] ${nullSongs.length}/${ids.length} songs need ungray: ${nullSongs.map(s => s.id).join(',')}`);
+
+        // 2) 获取这些歌曲的元数据（用于在第三方平台搜索）
+        const nullIds = nullSongs.map(s => s.id);
+        let songMetaMap = new Map();
+
+        try {
+          const detailRes = await req_(
+            '/api/v3/song/detail',
+            { ids: JSON.stringify(nullIds.map(id => ({ id: String(id) }))) },
+            { crypto: 'weapi', cookie: query.cookie, ua: query.ua || '', realIP: getRealIp(req), e_r: query.e_r, domain: '', checkToken: false }
+          );
+          const songs = detailRes.body?.songs || [];
+          for (const song of songs) {
+            songMetaMap.set(String(song.id), {
+              name: song.name,
+              artist: (song.ar || []).map(a => a.name).join(','),
+              album: song.al?.name || '',
+              albumId: song.al?.id,
+              duration: song.dt,
+            });
+          }
+        } catch (e) {
+          console.warn('[UNM] song_detail failed, using minimal metadata:', e.message);
+          for (const id of nullIds) {
+            songMetaMap.set(String(id), { name: '', artist: '', album: '', albumId: null, duration: 0 });
+          }
+        }
+
+        // 3) 用 UNM 解灰
+        const fallbackMap = new Map();
+
+        if (unmMatch) {
+          // 串行解灰，避免并发过高被限流
+          for (const id of nullIds) {
+            const meta = songMetaMap.get(String(id)) || {};
+            console.log(`[UNM] Searching for: ${meta.name || id} - ${meta.artist || 'unknown'}`);
+
+            try {
+              const result = await unmMatch(String(id), UNM_SERVERS, {
+                name: meta.name || '',
+                artist: meta.artist || '',
+                album: meta.album || '',
+                albumId: meta.albumId,
+                duration: meta.duration,
+              });
+
+              if (result?.url) {
+                fallbackMap.set(String(id), {
+                  id: Number(id),
+                  url: result.url,
+                  br: result.br || br,
+                  size: result.size || 0,
+                  type: result.type || 'mp3',
+                  md5: result.md5 || '',
+                  code: 200,
+                  level: 'standard',
+                  gain: 0,
+                  peak: 0,
+                  mvUrl: nullSongs.find(s => String(s.id) === String(id))?.mvUrl || null,
+                });
+                console.log(`[UNM] ✓ id=${id} got URL from ${result.source}: ${result.url.substring(0, 80)}`);
+              } else {
+                console.log(`[UNM] ✗ id=${id} no URL returned`);
+              }
+            } catch (e) {
+              console.log(`[UNM] ✗ id=${id} error: ${e.message}`);
+            }
+          }
+        } else {
+          console.log('[UNM] UNM not available, skipping fallback');
+        }
+
+        // 4) 合并结果
+        const merged = mainData.map(item => {
+          if (item.url && item.url !== '') return item;
+          return fallbackMap.get(String(item.id)) || item;
+        });
+
+        merged.sort((a, b) => ids.indexOf(String(a.id)) - ids.indexOf(String(b.id)));
+        const successCount = merged.filter(i => i.url).length;
+        console.log(`[UNM] Final: ${successCount}/${ids.length} songs have URL`);
+
+        res.status(200).send({ code: 200, data: merged });
+      } catch (err) {
+        console.error('[UNM] Fatal error:', err.message);
+        res.status(502).send({ code: 502, msg: 'Song URL failed', detail: err.message });
+      }
+    });
+  }
+
+  // 确保 B站缓存目录存在
   try {
     const biliCacheDir = path.join(__dirname, 'node_modules', 'netease-cloud-music-api-alger', 'cache');
     if (!fs.existsSync(biliCacheDir)) {
